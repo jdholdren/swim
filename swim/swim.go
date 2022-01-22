@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/oklog/run"
 	"go.uber.org/zap"
 )
@@ -42,8 +42,10 @@ const (
 
 // The overarching type
 type message struct {
-	Type msgType `json:"msgType"`
-	Port int     `json:"senderPort"`
+	UUID    string   `json:"uuid"`
+	Type    msgType  `json:"msgType"`
+	Port    int      `json:"senderPort"`
+	Members []Member `json:"members"`
 }
 
 type Config struct {
@@ -55,6 +57,17 @@ type Config struct {
 	InitialList  []string `env:"INITIAL_LIST"`
 }
 
+type memberMap map[string]Member
+
+func (m memberMap) Slice() []Member {
+	ret := make([]Member, 0, len(m))
+	for _, member := range m {
+		ret = append(ret, member)
+	}
+
+	return ret
+}
+
 // Swim is an instance of the swim agent
 type Swim struct {
 	cfg Config // IDK if i just like embedding this into the singleton
@@ -62,13 +75,13 @@ type Swim struct {
 
 	// This area deals with the member list itself
 	membersLock sync.RWMutex
-	members     []Member // List of our currently good members
+	members     memberMap // An indexed set of the members
 }
 
-func NewSwim(cfg Config) (*Swim, error) {
-	l, _ := zap.NewDevelopment()
+func New(cfg Config) (*Swim, error) {
+	l := zap.NewNop()
 
-	mems := make([]Member, 0, len(cfg.InitialList))
+	mems := memberMap{}
 	for _, ip := range cfg.InitialList {
 		// Parse the pieces ip to make sure it's good
 		parts := strings.Split(ip, ":")
@@ -82,14 +95,19 @@ func NewSwim(cfg Config) (*Swim, error) {
 			return nil, fmt.Errorf("port was not a number: %s", ip)
 		}
 
-		mems = append(mems, Member{
+		mems[ip] = Member{
 			IP: ip,
-		})
+		}
+	}
+
+	if cfg.Name == "" {
+		cfg.Name = "swmnode-" + uuid.NewString()
 	}
 
 	return &Swim{
-		cfg: cfg,
-		l:   l.Sugar().With("name", cfg.Name),
+		cfg:     cfg,
+		l:       l.Sugar().With("name", cfg.Name),
+		members: mems,
 	}, nil
 }
 
@@ -97,7 +115,6 @@ func NewSwim(cfg Config) (*Swim, error) {
 // It's safe to call this method concurrently, but it may time out
 func (s *Swim) Members(ctx context.Context) ([]Member, error) {
 	resp := make(chan []Member)
-	defer close(resp)
 
 	go func() {
 		s.membersLock.RLock()
@@ -105,10 +122,8 @@ func (s *Swim) Members(ctx context.Context) ([]Member, error) {
 
 		// This routine may be running after the context has been canceled,
 		// so the channel may be closed: do a non-blocking send on the channel
-		var mems []Member
-		copy(mems, s.members)
 		select {
-		case resp <- mems:
+		case resp <- s.members.Slice():
 		default:
 		}
 	}()
@@ -127,16 +142,38 @@ func (s *Swim) Members(ctx context.Context) ([]Member, error) {
 // Listen starts all components of the swimmer.
 // It blocks until error or canceled.
 func (s *Swim) Listen(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	pcktReceived := make(chan packet)
 	defer close(pcktReceived)
 
 	// Start each piece
 	var g run.Group
+	// The receiver
 	g.Add(func() error {
 		return s.receiveMessages(ctx, pcktReceived)
 	}, func(err error) {
+		cancel()
+	})
+	// The pinger
+	g.Add(func() error {
+		return s.sendPings(ctx)
+	}, func(err error) {
+		cancel()
 	})
 
+	// The event loop itself
+	g.Add(func() error {
+		return s.eventLoop(ctx, pcktReceived)
+	}, func(err error) {
+		cancel()
+	})
+
+	return g.Run()
+}
+
+func (s *Swim) eventLoop(ctx context.Context, pcktReceived <-chan packet) error {
 	// The event loop here to respond to everything
 	for {
 		select {
@@ -144,16 +181,17 @@ func (s *Swim) Listen(ctx context.Context) error {
 			return ErrInterrupt
 		case p := <-pcktReceived:
 			go s.handlePacket(p)
+			// TODO: Add for ping/ping-req received
 		}
 	}
 
-	return g.Run()
+	return nil
 }
 
 // Opens a connection on the port and emits messages on the channel
 func (s *Swim) receiveMessages(ctx context.Context, out chan<- packet) error {
 	addr := &net.UDPAddr{
-		Port: 4444,
+		Port: s.cfg.ReceiverPort,
 		IP:   net.ParseIP("127.0.0.1"),
 	}
 	conn, err := net.ListenUDP("udp", addr)
@@ -163,7 +201,7 @@ func (s *Swim) receiveMessages(ctx context.Context, out chan<- packet) error {
 
 	// This is the channel that receives packets from the socket
 	pCh := make(chan packet)
-	defer close(pCh) // Close your channels
+	// defer close(pCh) // Close your channels
 
 	// Start a loop for receiving
 	go func() {
@@ -177,13 +215,13 @@ func (s *Swim) receiveMessages(ctx context.Context, out chan<- packet) error {
 			}
 
 			// Log out the message
-			c := make([]byte, s.cfg.MessageSize)
-			copy(c, b)
-			pCh <- packet{
-				remote: remoteAddr,
-				byts:   c,
-				length: l,
-			}
+			go func() {
+				pCh <- packet{
+					remote: remoteAddr,
+					byts:   b,
+					length: l,
+				}
+			}()
 		}
 	}()
 
@@ -206,20 +244,54 @@ func (s *Swim) receiveMessages(ctx context.Context, out chan<- packet) error {
 // - Decodes the message
 // - Checks the encryption
 // - Updates internal state (member list, lamport clocks)
-// - Sends an ack
+// - Sends out the correct channel
 func (s *Swim) handlePacket(p packet) {
 	// Log for now
-	s.l.Debugw("handlePacket",
-		"remote", fmt.Sprintf("%s:%d", p.remote.IP.String(), p.remote.Port),
-		"content", string(p.byts[:p.length]),
-	)
+	content := p.byts[:p.length]
+	// s.l.Debugw("handlePacket",
+	// 	"remote", fmt.Sprintf("%s:%d", p.remote.IP.String(), p.remote.Port),
+	// 	"content", string(content),
+	// )
+
+	var msg message
+	if err := json.Unmarshal(content, &msg); err != nil {
+		s.l.Errorw("error unmarshaling packet", "err", err)
+		return
+	}
+
+	s.membersLock.Lock()
+	defer s.membersLock.Unlock()
+
+	// Add who's pinging
+	s.members[msg.UUID] = Member{
+		Name: msg.UUID,
+		IP:   fmt.Sprintf("%s:%d", p.remote.IP.String(), msg.Port),
+	}
+
+	// Use their piggy back info to update the list
+	for _, m := range msg.Members {
+		if m.Name == s.cfg.Name {
+			continue // Don't add ourselves
+		}
+
+		s.members[m.Name] = Member{
+			Name: m.Name,
+			IP:   m.IP,
+		}
+	}
+
+	// Clear any nameless entries, they are from the start
+	for k, v := range s.members {
+		if v.Name == "" {
+			delete(s.members, k)
+		}
+	}
 }
 
 // Is a random timer that pings k other nodes on that interval
 func (s *Swim) sendPings(ctx context.Context) error {
-	t := time.NewTimer(time.Duration(s.cfg.PingInterval) * time.Millisecond)
-
 	for {
+		t := time.NewTimer(time.Duration(s.cfg.PingInterval) * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -228,54 +300,58 @@ func (s *Swim) sendPings(ctx context.Context) error {
 		}
 
 		// Get a snapshot of the current members to determine who to ping
-		var mems []Member
 		s.membersLock.RLock()
-		copy(mems, s.members)
+		mems := s.members.Slice()
 		s.membersLock.RUnlock()
 		l := len(mems)
+
+		s.l.Debugw("about to select members", "mems", mems)
 
 		// Select k members in the list
 		var toPing []Member
 		if l == 0 {
 			continue
 		}
-		if l <= s.cfg.K {
-			// we can ping all of them, k encompasses the whole list
-			toPing = mems
-		} else {
-			// Select a root number to select the next 3
-			root := rand.Intn(l)
-			for i := 0; i < s.cfg.K; i++ {
-				n := (i + root) % l // Get a safe index to access
-				toPing = append(toPing, mems[n])
-			}
-		}
+		toPing = mems
+		// if l <= s.cfg.K {
+		// 	// we can ping all of them, k encompasses the whole list
+		// } else {
+		// 	// Select a root number to select the next 3
+		// 	root := rand.Intn(l)
+		// 	for i := 0; i < s.cfg.K; i++ {
+		// 		n := (i + root) % l // Get a safe index to access
+		// 		toPing = append(toPing, mems[n])
+		// 	}
+		// }
 
 		for _, mem := range toPing {
-			// TODO: These need to be their own routine
-			conn, err := net.Dial("udp", mem.IP)
-			if err != nil {
-				return fmt.Errorf("error dialing remote '%s': %s", mem.IP, err)
-			}
-			defer conn.Close()
+			go func() error {
+				conn, err := net.Dial("udp", mem.IP)
+				if err != nil {
+					return fmt.Errorf("error dialing remote '%s': %s", mem.IP, err)
+				}
+				defer conn.Close()
 
-			packetBytes, err := json.Marshal(message{
-				Type: msgTypePing,
-				Port: s.cfg.ReceiverPort, // Include your own port so the receiver knows who to talk back to
-			})
-			if err != nil {
-				// A fairly severe error if we can't marshal our own messages
-				return fmt.Errorf("error marshalling ping message: %s", err)
-			}
+				packetBytes, err := json.Marshal(message{
+					Type:    msgTypePing,
+					Port:    s.cfg.ReceiverPort, // Include your own port so the receiver knows who to talk back to
+					Members: mems,
+					UUID:    s.cfg.Name,
+				})
+				if err != nil {
+					// A fairly severe error if we can't marshal our own messages
+					return fmt.Errorf("error marshalling ping message: %s", err)
+				}
 
-			// Send the damn thing
-			// TODO: check that we wrote all the bytes
-			if _, err := fmt.Fprintf(conn, string(packetBytes)); err != nil {
-				// It's udp, so if we can't send, something's wrong
-				return fmt.Errorf("error writing to remote: %s", err)
-			}
+				// Send the damn thing
+				// TODO: check that we wrote all the bytes
+				if _, err := fmt.Fprintf(conn, string(packetBytes)); err != nil {
+					// It's udp, so if we can't send, something's wrong
+					return fmt.Errorf("error writing to remote: %s", err)
+				}
 
-			// TODO: Expect an ack (after these are their own routines)
+				return nil
+			}()
 		}
 	}
 

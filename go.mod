@@ -3,6 +3,7 @@ module github.com/jdholdren/swim
 go 1.16
 
 require (
+	github.com/google/uuid v1.3.0 // indirect
 	github.com/oklog/run v1.1.0
 	github.com/sethvargo/go-envconfig v0.4.0 // indirect
 	github.com/withmandala/go-log v0.1.0
